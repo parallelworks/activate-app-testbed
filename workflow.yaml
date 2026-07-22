@@ -93,7 +93,7 @@ permissions:
             label: Resource
             type: compute-clusters
           worker_name:
-            label: Worker name (blank = worker-<hostname>)
+            label: Worker name (blank = worker-<user>-<hostname>)
             type: string
             default: ""
           workdir:
@@ -345,6 +345,10 @@ jobs:
           SRV_USER="${{ inputs.server.resource.user }}"
           TMETHOD="${{ inputs.app.tunnel_method }}"
           WAIT_WORKERS=$(echo "${{ inputs.app.wait_for_workers }}" | tr '[:upper:]' '[:lower:]')
+          # worker names default to worker-<pw user>-<hostname>: hostname
+          # alone collides when several platform users dispatch to the same
+          # host, and a same-name registration bumps the earlier worker
+          PW_USER=$(pw auth whoami 2>/dev/null | tail -1)
           WORKERS_JSON=$(cat <<'WJSONEOF'
           ${{ inputs.workers }}
           WJSONEOF
@@ -352,7 +356,7 @@ jobs:
           BOOT_B64=$(base64 -w0 <<'WBOOTEOF'
           set -e
           PORT=$1; SRV_RES=$2; WNAME=$3; ROOT_IN=$4
-          SCHED=${5:-none}; PQ=${6:-}; ACCT=${7:-}; WT=${8:-}; EXTRA=${9:-}; TMETHOD=${10:-auto}; IS_LOCAL=${11:-}; SRV_USER=${12:-}; PBS_B64=${13:-}
+          SCHED=${5:-none}; PQ=${6:-}; ACCT=${7:-}; WT=${8:-}; EXTRA=${9:-}; TMETHOD=${10:-auto}; IS_LOCAL=${11:-}; SRV_USER=${12:-}; PBS_B64=${13:-}; PW_USER=${14:-}
           ROOT=$(eval echo "$ROOT_IN")
           mkdir -p "$ROOT"
           health() { curl -sf -m 3 -o /dev/null "http://127.0.0.1:$PORT/health"; }
@@ -487,7 +491,7 @@ jobs:
           set -e
           curl -sf -m 5 "http://$SELF_IP:$PORT/health" >/dev/null || { echo "ERROR: cannot reach server from \$(hostname)"; exit 1; }
           NAME="$WNAME"
-          [ -n "\$NAME" ] || NAME=worker-\$(hostname -s)
+          [ -n "\$NAME" ] || NAME=worker-${PW_USER:+$PW_USER-}\$(hostname -s)
           # the worker's output goes to its own file: PBS spools the job's
           # stdout and only writes the -o file at job end, so the job log
           # cannot be polled during the run
@@ -541,7 +545,7 @@ jobs:
             echo "SUBMITTED_JOBID=${JOBID:-unknown} JOBLOG=$ROOT/worker-run.log"
             exit 0
           fi
-          [ -n "$WNAME" ] || WNAME=worker-$(hostname -s)
+          [ -n "$WNAME" ] || WNAME=worker-${PW_USER:+$PW_USER-}$(hostname -s)
           if [ -z "$IS_LOCAL" ]; then
             # remote sites must go through the tunnel; if the port answers
             # with no tunnel present, another service owns it
@@ -665,7 +669,7 @@ jobs:
             # PATH on the remote side.
             LOCAL=""
             [ "$NAME" = "$SRV_RES" ] && LOCAL=1
-            if OUT=$(pw ssh "$NAME" "export PW_API_KEY='$PW_API_KEY' PW_PLATFORM_HOST='$PW_PLATFORM_HOST'; echo $BOOT_B64 | base64 -d | bash -ls -- '$PORT' '$SRV_RES' '$WNAME' '$WD' '$SCHED' '$PQ' '$ACCT' '$WT' '$EXTRA' '$TMETHOD' '$LOCAL' '$SRV_USER' '$PBSD'" 2>&1); then
+            if OUT=$(pw ssh "$NAME" "export PW_API_KEY='$PW_API_KEY' PW_PLATFORM_HOST='$PW_PLATFORM_HOST'; echo $BOOT_B64 | base64 -d | bash -ls -- '$PORT' '$SRV_RES' '$WNAME' '$WD' '$SCHED' '$PQ' '$ACCT' '$WT' '$EXTRA' '$TMETHOD' '$LOCAL' '$SRV_USER' '$PBSD' '$PW_USER'" 2>&1); then
               echo "$OUT"
               JOBID=$(echo "$OUT" | grep -a 'SUBMITTED_JOBID=' | grep -oE 'SUBMITTED_JOBID=[0-9]+' | head -1 | cut -d= -f2)
               JOBLOG=$(echo "$OUT" | grep -a 'JOBLOG=' | grep -oE 'JOBLOG=[^ ]+' | head -1 | cut -d= -f2)

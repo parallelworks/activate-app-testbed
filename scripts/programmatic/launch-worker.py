@@ -177,7 +177,7 @@ def main():
     arg("--server-host", required=True, help="cluster running (or to run) the server")
     arg("--site", action="append", required=True,
         help="cluster to run a worker on (repeatable; name or pw:// URI)")
-    arg("--worker-name", default="", help="blank = worker-<hostname>; ignored with multiple sites")
+    arg("--worker-name", default="", help="blank = worker-<pw user>-<hostname>; ignored with multiple sites")
     arg("--worker-workdir", default="~/app-testbed-worker")
     arg("--scheduler", action="store_true", help="submit workers as batch jobs")
     arg("--partition", default="", help="SLURM partition / PBS queue")
