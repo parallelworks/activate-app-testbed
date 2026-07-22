@@ -211,7 +211,21 @@ jobs:
                   self.wfile.write(body)
 
               def do_GET(self):
-                  if self.path == "/health":
+                  if self.path == "/":
+                      live = sum(1 for w in workers.values() if w.get("connected"))
+                      body = ("<html><head><title>app-testbed</title></head>"
+                              "<body style=\'font-family:sans-serif;margin:2em\'>"
+                              "<h2>app-testbed server</h2>"
+                              "<p>%d worker(s) registered, %d connected.</p>"
+                              "<p><a href=\'/workers\'>/workers</a> &middot; "
+                              "<a href=\'/health\'>/health</a></p>"
+                              "</body></html>" % (len(workers), live)).encode()
+                      self.send_response(200)
+                      self.send_header("Content-Type", "text/html")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                  elif self.path == "/health":
                       self._json(200, {"ok": True, "workers": len(workers)})
                   elif self.path == "/workers":
                       self._json(200, workers)
