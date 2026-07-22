@@ -1,0 +1,698 @@
+permissions:
+  - "*"
+
+# Reference pattern for a multi-site client-server deployment: a service
+# on one cluster, exposed through an endpoint session, with workers on
+# other clusters that register over HTTP and hold a WebSocket, reaching
+# the service through SSH tunnels. Workers run on login nodes or as
+# SLURM/PBS batch jobs.
+#
+# The embedded server and worker are minimal stand-ins (stdlib Python,
+# no external artifacts) so the workflow runs anywhere with python3 and
+# the pw CLI. To adapt this to a real application, replace the server.py
+# and worker.py heredocs with commands that start your own service and
+# client; the deployment pattern (endpoint session, tunnels with the
+# websocket probe, remote dispatch, scheduler submission, supervised
+# connect) is the reusable part and needs no changes.
+
+"on":
+  execute:
+    inputs:
+      server:
+        label: Server host
+        type: group
+        collapsed: false
+        items:
+          resource:
+            label: Cluster
+            type: compute-clusters
+            autoselect: true
+            tooltip: |
+              Cluster for the server and its endpoint session. The server
+              runs on the node the workflow lands on.
+      services:
+        label: Services
+        type: group
+        collapsed: false
+        items:
+          deploy_server:
+            label: Deploy server
+            type: boolean
+            default: true
+            tooltip: |
+              Off: leave any already-running server untouched, e.g. for
+              workers-only runs against a live server.
+          restart_server:
+            label: Restart server if already running
+            type: boolean
+            default: false
+      app:
+        label: Settings
+        type: group
+        collapsed: true
+        items:
+          workdir:
+            label: Server working directory
+            type: string
+            default: ~/app-testbed
+          subdomain:
+            label: Session subdomain
+            type: string
+            default: apptest
+          server_port:
+            label: Server port
+            type: number
+            default: 8090
+          wait_for_workers:
+            label: Wait for workers to connect
+            type: boolean
+            default: true
+            tooltip: |
+              On: the dispatch blocks until each worker connects and the
+              run fails otherwise; keep on when the run result is used
+              to verify tunnel behavior. Off: submit and finish the run.
+          tunnel_method:
+            label: Tunnel method (auto | ssh | pw-forward)
+            type: string
+            default: auto
+            tooltip: |
+              auto: plain ssh via the platform proxy command when the pwcli
+              key exists, otherwise pw forward. ssh: always plain ssh.
+              pw-forward: always pw forward; use this to verify whether a
+              pw CLI release passes websocket upgrades (the dispatch fails
+              if upgrades do not traverse the tunnel).
+      workers:
+        label: Worker sites
+        type: list
+        tooltip: |
+          Clusters to run a worker on. The server host connects directly
+          on localhost; other sites reach the server through a persistent
+          SSH tunnel to the server host.
+        template:
+          resource:
+            label: Resource
+            type: compute-clusters
+          worker_name:
+            label: Worker name (blank = worker-<hostname>)
+            type: string
+            default: ""
+          workdir:
+            label: Worker working directory
+            type: string
+            default: ~/app-testbed-worker
+          scheduler:
+            label: Submit via scheduler?
+            type: boolean
+            default: false
+            tooltip: |
+              Off: the worker runs on the site's login/mgmt node. On: the
+              worker is submitted as a batch job (SLURM or PBS, detected
+              from the resource) and runs on a compute node for the
+              job's walltime.
+          slurm:
+            label: SLURM directives
+            type: group
+            hidden: ${{ inputs.workers.[index].resource.schedulerType != 'slurm' || inputs.workers.[index].scheduler == false }}
+            items:
+              partition:
+                label: Partition
+                type: slurm-partitions
+                resource: ${{ inputs.workers.[index].resource }}
+              account:
+                label: Account
+                type: slurm-accounts
+                resource: ${{ inputs.workers.[index].resource }}
+              time:
+                label: Walltime
+                type: string
+                default: "01:00:00"
+              extra:
+                label: Extra sbatch args
+                type: string
+                default: ""
+          pbs:
+            label: PBS directives
+            type: group
+            hidden: ${{ inputs.workers.[index].resource.schedulerType != 'pbs' || inputs.workers.[index].scheduler == false }}
+            items:
+              account:
+                label: Account
+                type: string
+                default: ""
+                tooltip: PBS account string for job submission (-A)
+              scheduler_directives:
+                label: Directives
+                type: editor
+                tooltip: |
+                  Inserted into the batch script verbatim; keep the #PBS
+                  prefix on each line. -N, -o, -j and -V come from the
+                  workflow. Add account (-A) and select lines as the
+                  system requires.
+                default: |
+                  #PBS -q debug
+                  #PBS -l select=1:ncpus=1
+                  #PBS -l walltime=00:30:00
+
+# Job graph (all jobs run on the server host; worker sites are reached
+# from it over pw ssh):
+#
+#   setup -- start_server --+-- expose_session
+#                           +-- dispatch_workers
+#
+# The server host connects directly; remote workers connect through an
+# SSH tunnel. Scheduled workers use a tunnel that terminates on the
+# submit node bound to its cluster-internal IP, so compute nodes only
+# need internal routing (no pw CLI or egress).
+
+jobs:
+  setup:
+    ssh:
+      remoteHost: ${{ inputs.server.resource.ip }}
+    steps:
+      - name: Prepare workspace
+        run: |
+          set -e
+          WORKDIR=$(eval echo ${{ inputs.app.workdir }})
+          mkdir -p "$WORKDIR"
+          echo "workspace ready: $WORKDIR"
+
+  start_server:
+    needs:
+      - setup
+    ssh:
+      remoteHost: ${{ inputs.server.resource.ip }}
+    steps:
+      - name: Start server
+        run: |
+          set -e
+          SRV_ON=$(echo "${{ inputs.services.deploy_server }}" | tr '[:upper:]' '[:lower:]')
+          [ "$SRV_ON" = "true" ] || { echo "server deployment disabled; skipping"; exit 0; }
+          WORKDIR=$(eval echo ${{ inputs.app.workdir }})
+          PORT=${{ inputs.app.server_port }}
+          cat > "$WORKDIR/server.py" <<'SPYEOF'
+          import base64, hashlib, http.server, json, socketserver, sys, time
+
+          PORT = int(sys.argv[1])
+          GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+          workers = {}
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def log_message(self, fmt, *args):
+                  sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+              def _json(self, code, obj):
+                  body = json.dumps(obj).encode()
+                  self.send_response(code)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_GET(self):
+                  if self.path == "/health":
+                      self._json(200, {"ok": True, "workers": len(workers)})
+                  elif self.path == "/workers":
+                      self._json(200, workers)
+                  elif self.path == "/ws":
+                      self._websocket()
+                  else:
+                      self._json(404, {"error": "not found"})
+
+              def do_POST(self):
+                  if self.path == "/register":
+                      n = int(self.headers.get("Content-Length", 0))
+                      d = json.loads(self.rfile.read(n) or b"{}")
+                      name = d.get("name", "unknown")
+                      workers[name] = {"registered": time.time(), "connected": False}
+                      self._json(200, {"ok": True, "name": name})
+                  else:
+                      self._json(404, {"error": "not found"})
+
+              def _websocket(self):
+                  key = self.headers.get("Sec-WebSocket-Key")
+                  if not key:
+                      self._json(400, {"error": "not a websocket request"})
+                      return
+                  accept = base64.b64encode(
+                      hashlib.sha1((key + GUID).encode()).digest()).decode()
+                  self.send_response(101, "Switching Protocols")
+                  self.send_header("Upgrade", "websocket")
+                  self.send_header("Connection", "Upgrade")
+                  self.send_header("Sec-WebSocket-Accept", accept)
+                  self.end_headers()
+                  name = self.headers.get("X-Worker-Name", "unknown")
+                  if name in workers:
+                      workers[name]["connected"] = True
+                      workers[name]["ws_since"] = time.time()
+                  self.connection.settimeout(300)
+                  try:
+                      while True:
+                          if not self.connection.recv(4096):
+                              break
+                  except OSError:
+                      pass
+                  finally:
+                      if name in workers:
+                          workers[name]["connected"] = False
+                  self.close_connection = True
+
+          class Server(socketserver.ThreadingTCPServer):
+              allow_reuse_address = True
+              daemon_threads = True
+
+          Server(("127.0.0.1", PORT), Handler).serve_forever()
+          SPYEOF
+          RESTART=$(echo "${{ inputs.services.restart_server }}" | tr '[:upper:]' '[:lower:]')
+          if [ "$RESTART" = "true" ] && pgrep -f "server.py $PORT" >/dev/null; then
+            echo "restart requested; stopping server"
+            pkill -f "server.py $PORT" || true
+            sleep 2
+          fi
+          if pgrep -f "server.py $PORT" >/dev/null; then
+            echo "server already running (pid $(pgrep -f "server.py $PORT" | head -1))"
+          else
+            setsid -f python3 "$WORKDIR/server.py" "$PORT" > "$WORKDIR/server.log" 2>&1 < /dev/null
+          fi
+          up=""
+          for i in $(seq 1 20); do
+            curl -sf -o /dev/null "http://127.0.0.1:$PORT/health" && up=1 && break
+            sleep 1
+          done
+          [ -n "$up" ] || { echo "ERROR: server not reachable on :$PORT; log tail:"; tail -20 "$WORKDIR/server.log"; exit 1; }
+          # confirm the websocket path answers an upgrade locally
+          WS=$(curl -si -m 5 --http1.1 -H "Upgrade: websocket" -H "Connection: Upgrade" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" -H "Sec-WebSocket-Version: 13" "http://127.0.0.1:$PORT/ws" 2>/dev/null | head -1)
+          echo "server health OK; local websocket probe: ${WS:-no response}"
+
+  expose_session:
+    needs:
+      - start_server
+    ssh:
+      remoteHost: ${{ inputs.server.resource.ip }}
+    steps:
+      - name: Expose server as endpoint session
+        run: |
+          set -e
+          SRV_ON=$(echo "${{ inputs.services.deploy_server }}" | tr '[:upper:]' '[:lower:]')
+          [ "$SRV_ON" = "true" ] || { echo "server deployment disabled; skipping"; exit 0; }
+          WORKDIR=$(eval echo ${{ inputs.app.workdir }})
+          PORT=${{ inputs.app.server_port }}
+          SUBDOMAIN=${{ inputs.app.subdomain }}
+          LOG="$WORKDIR/endpoint.log"
+          if ! pgrep -f "pw endpoints http.*$PORT" >/dev/null; then
+            setsid -f pw endpoints http "$PORT" \
+              --subdomain "$SUBDOMAIN" --name "$SUBDOMAIN" -o text \
+              > "$LOG" 2>&1 < /dev/null
+          fi
+          for i in $(seq 1 20); do
+            URL=$(grep -om1 "https://[^ ]*" "$LOG" 2>/dev/null) && break
+            sleep 1
+          done
+          [ -n "${URL:-}" ] || { echo "ERROR: no endpoint URL"; cat "$LOG"; exit 1; }
+          echo "server is up: $URL (worker status at $URL/workers)"
+          echo URL=$URL >> $OUTPUTS
+
+  dispatch_workers:
+    needs:
+      - start_server
+    ssh:
+      remoteHost: ${{ inputs.server.resource.ip }}
+    steps:
+      - name: Dispatch workers to sites
+        run: |
+          set -e
+          WORKDIR=$(eval echo ${{ inputs.app.workdir }})
+          PORT=${{ inputs.app.server_port }}
+          # use the resource URI, not the short name: a shared cluster in
+          # another namespace only resolves by its pw://owner/name URI
+          SRV_RES="${{ inputs.server.resource.uri }}"
+          [ -n "$SRV_RES" ] || SRV_RES="${{ inputs.server.resource.name }}"
+          SRV_USER="${{ inputs.server.resource.user }}"
+          TMETHOD="${{ inputs.app.tunnel_method }}"
+          WAIT_WORKERS=$(echo "${{ inputs.app.wait_for_workers }}" | tr '[:upper:]' '[:lower:]')
+          WORKERS_JSON=$(cat <<'WJSONEOF'
+          ${{ inputs.workers }}
+          WJSONEOF
+          )
+          BOOT_B64=$(base64 -w0 <<'WBOOTEOF'
+          set -e
+          PORT=$1; SRV_RES=$2; WNAME=$3; ROOT_IN=$4
+          SCHED=${5:-none}; PQ=${6:-}; ACCT=${7:-}; WT=${8:-}; EXTRA=${9:-}; TMETHOD=${10:-auto}; IS_LOCAL=${11:-}; SRV_USER=${12:-}; PBS_B64=${13:-}
+          ROOT=$(eval echo "$ROOT_IN")
+          mkdir -p "$ROOT"
+          health() { curl -sf -m 3 -o /dev/null "http://127.0.0.1:$PORT/health"; }
+          # websocket probe: a 101/403 response means upgrades pass through
+          # the tunnel; a timeout means the tunnel is stale
+          ws_ok() { curl -si -m 8 --http1.1 -H "Upgrade: websocket" -H "Connection: Upgrade" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" -H "Sec-WebSocket-Version: 13" "$1/ws" 2>/dev/null | head -1 | grep -qE "HTTP/1.[01] (101|403)"; }
+          # tunnel method is selectable so pw forward releases can be
+          # verified against the websocket probe; auto prefers plain ssh
+          # via the platform proxy command when the pwcli key exists
+          start_tunnel() { # $1 = bind spec, e.g. IP:PORT:localhost:PORT
+            USE=$TMETHOD
+            [ "$USE" = "auto" ] && { [ -f "$HOME/.ssh/pwcli" ] && USE=ssh || USE=pw-forward; }
+            if [ "$USE" = "ssh" ] && [ ! -f "$HOME/.ssh/pwcli" ]; then
+              echo "WARNING: ssh tunnel requested but no pwcli key; using pw forward"
+              USE=pw-forward
+            fi
+            echo "starting $USE tunnel to $SRV_RES"
+            if [ "$USE" = "ssh" ]; then
+              setsid -f ssh -i "$HOME/.ssh/pwcli" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o "ProxyCommand=pw ssh --proxy-command %h" -N -L "$1" "${SRV_USER:-$USER}@$SRV_RES" > "$ROOT/tunnel.log" 2>&1 < /dev/null
+            else
+              setsid -f pw forward -L "$1" "$SRV_RES" > "$ROOT/tunnel.log" 2>&1 < /dev/null
+            fi
+          }
+          # sites without the platform ssh key adopt the server host's:
+          # the per-user key is accepted across resources, and it rides
+          # pw ssh stdout rather than a command line. Skipped when
+          # pw forward was requested explicitly.
+          if [ "$TMETHOD" != "pw-forward" ] && [ ! -f "$HOME/.ssh/pwcli" ] && [ -z "$IS_LOCAL" ]; then
+            mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+            ( umask 077; pw ssh "$SRV_RES" "cat ~/.ssh/pwcli" 2>/dev/null | sed -n "/BEGIN/,/END/p" > "$HOME/.ssh/pwcli.tmp" ) || true
+            if grep -q "PRIVATE KEY" "$HOME/.ssh/pwcli.tmp" 2>/dev/null; then
+              mv "$HOME/.ssh/pwcli.tmp" "$HOME/.ssh/pwcli"
+              echo "adopted the server host's platform ssh key for tunnels"
+            else
+              rm -f "$HOME/.ssh/pwcli.tmp"
+            fi
+          fi
+          # a pw forward tunnel left over from a run without the key is
+          # replaced by the plain-ssh tunnel
+          if [ "$TMETHOD" != "pw-forward" ] && [ -f "$HOME/.ssh/pwcli" ] && pgrep -f "pw forward -L [^ ]*$PORT:localhost:$PORT" >/dev/null; then
+            echo "replacing leftover pw forward tunnel with plain ssh"
+            pkill -f "pw forward -L [^ ]*$PORT:localhost:$PORT" || true
+            sleep 1
+          fi
+          cat > "$ROOT/worker.py" <<'WPYEOF'
+          import base64, http.client, json, os, socket, sys, time
+
+          host, port, name = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+          conn = http.client.HTTPConnection(host, port, timeout=10)
+          conn.request("POST", "/register", json.dumps({"name": name}),
+                       {"Content-Type": "application/json"})
+          resp = conn.getresponse()
+          resp.read()
+          print("worker %s registered: HTTP %d" % (name, resp.status), flush=True)
+          if resp.status != 200:
+              sys.exit(1)
+
+          sock = socket.create_connection((host, port), timeout=15)
+          key = base64.b64encode(os.urandom(16)).decode()
+          req = ("GET /ws HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
+                 "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+                 "Sec-WebSocket-Version: 13\r\nX-Worker-Name: %s\r\n\r\n"
+                 % (host, port, key, name))
+          sock.sendall(req.encode())
+          status = sock.recv(1024).decode(errors="replace").split("\r\n")[0]
+          if " 101 " not in status + " ":
+              print("worker %s WebSocket rejected: %s" % (name, status), flush=True)
+              sys.exit(1)
+          print("worker %s WebSocket Connected" % name, flush=True)
+
+          sock.settimeout(None)
+          while True:
+              time.sleep(30)
+              # masked ping frame keeps the connection alive; a send failure
+              # means the connection dropped, so exit and let the supervisor
+              # restart the worker
+              try:
+                  sock.sendall(b"\x89\x80" + os.urandom(4))
+              except OSError:
+                  print("worker %s connection lost" % name, flush=True)
+                  sys.exit(1)
+          WPYEOF
+          if [ "$SCHED" = "slurm" ] || [ "$SCHED" = "pbs" ]; then
+            JOBNAME="worker-${WNAME:-testbed}"
+            # live states only; canceled jobs linger in CG for a while and
+            # must not block resubmission
+            if [ "$SCHED" = "slurm" ]; then
+              QUEUED=$(squeue -h -u "$USER" -n "$JOBNAME" -t PENDING,RUNNING,CONFIGURING,SUSPENDED 2>/dev/null | head -1)
+            else
+              QUEUED=$(qstat 2>/dev/null | grep -F "$JOBNAME" | awk '$5 ~ /^(Q|R|H|W|T)$/' | head -1)
+            fi
+            if [ -n "$QUEUED" ]; then
+              echo "worker batch job already queued/running: $QUEUED"
+              exit 0
+            fi
+            # compute nodes may lack outbound network access, so the tunnel
+            # terminates on the submit node, bound to its cluster-internal
+            # IP; batch jobs only need internal routing to this node
+            SELF_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+            [ -n "$SELF_IP" ] || SELF_IP=$(hostname -i | awk '{print $1}')
+            if [ -n "$IS_LOCAL" ]; then
+              curl -sf -m 5 "http://$SELF_IP:$PORT/health" >/dev/null || {
+                echo "ERROR: server not reachable at http://$SELF_IP:$PORT from other nodes"; exit 1; }
+            else
+              TPAT="[-]L [^ ]*$PORT:localhost:$PORT"
+              if pgrep -f "$TPAT" >/dev/null && ! ws_ok "http://$SELF_IP:$PORT"; then
+                echo "existing tunnel fails the websocket probe; recreating it"
+                pkill -f "$TPAT" || true
+                sleep 1
+              fi
+              if ! pgrep -f "$TPAT" >/dev/null; then
+                start_tunnel "$SELF_IP:$PORT:localhost:$PORT"
+              fi
+              ok=""
+              for i in $(seq 1 20); do curl -sf -m 3 "http://$SELF_IP:$PORT/health" >/dev/null && ws_ok "http://$SELF_IP:$PORT" && ok=1 && break; sleep 1; done
+              [ -n "$ok" ] || { echo "ERROR: server unreachable through submit-node tunnel; tunnel.log:"; tail -20 "$ROOT/tunnel.log"; exit 1; }
+            fi
+            # the worker runs in the foreground so the allocation lives as
+            # long as the worker; restart it until the Connected line
+            # appears, since a transient tunnel blip would otherwise strand
+            # the first attempt
+            cat > "$ROOT/worker-job.sh" <<JOBEOF
+          #!/bin/bash
+          JOBEOF
+            # PBS reads directives from the script; slurm directives stay
+            # on the sbatch command line
+            if [ "$SCHED" = "pbs" ] && [ -n "$PBS_B64" ]; then
+              echo "$PBS_B64" | base64 -d >> "$ROOT/worker-job.sh"
+            fi
+            cat >> "$ROOT/worker-job.sh" <<JOBEOF
+          set -e
+          curl -sf -m 5 "http://$SELF_IP:$PORT/health" >/dev/null || { echo "ERROR: cannot reach server from \$(hostname)"; exit 1; }
+          NAME="$WNAME"
+          [ -n "\$NAME" ] || NAME=worker-\$(hostname -s)
+          # the worker's output goes to its own file: PBS spools the job's
+          # stdout and only writes the -o file at job end, so the job log
+          # cannot be polled during the run
+          : > "$ROOT/worker-run.log"
+          MARK=0
+          for ATT in 1 2 3 4 5; do
+            python3 "$ROOT/worker.py" "$SELF_IP" "$PORT" "\$NAME" < /dev/null >> "$ROOT/worker-run.log" 2>&1 &
+            WPID=\$!
+            for i in \$(seq 1 30); do
+              CONNS=\$(grep -ac "WebSocket Connected" "$ROOT/worker-run.log" 2>/dev/null || true); CONNS=\${CONNS:-0}
+              [ "\$CONNS" -gt "\$MARK" ] && break
+              kill -0 \$WPID 2>/dev/null || break
+              sleep 2
+            done
+            CONNS=\$(grep -ac "WebSocket Connected" "$ROOT/worker-run.log" 2>/dev/null || true); CONNS=\${CONNS:-0}
+            if [ "\$CONNS" -gt "\$MARK" ]; then
+              echo "worker connected on attempt \$ATT"
+              wait \$WPID
+              exit \$?
+            fi
+            MARK=\$CONNS
+            echo "attempt \$ATT: no websocket connect within 60s; restarting worker"
+            kill -9 \$WPID 2>/dev/null || true
+            pkill -9 -f "$ROOT/worker.py" 2>/dev/null || true
+            sleep 3
+          done
+          echo "ERROR: worker failed to connect after 5 attempts"
+          exit 1
+          JOBEOF
+            chmod +x "$ROOT/worker-job.sh"
+            if [ "$SCHED" = "slurm" ]; then
+              CMD=(sbatch --job-name="$JOBNAME" --output="$ROOT/worker-job.log" --nodes=1)
+              [ -n "$PQ" ] && CMD+=(--partition="$PQ")
+              [ -n "$ACCT" ] && CMD+=(--account="$ACCT")
+              [ -n "$WT" ] && CMD+=(--time="$WT")
+              [ -n "$EXTRA" ] && CMD+=($EXTRA)
+            else
+              # -V exports the submit environment into the job. Queue,
+              # walltime etc. come from the #PBS lines embedded in the
+              # script.
+              CMD=(qsub -V -N "$JOBNAME" -o "$ROOT/worker-job.log" -j oe)
+              [ -n "$ACCT" ] && CMD+=(-A "$ACCT")
+            fi
+            rm -f "$ROOT/worker-job.log" "$ROOT/worker-run.log"
+            SUBMIT_OUT=$("${CMD[@]}" "$ROOT/worker-job.sh")
+            echo "$SUBMIT_OUT"
+            JOBID=$(echo "$SUBMIT_OUT" | grep -oE '[0-9]+' | head -1)
+            # pw ssh buffers remote stdout until exit, so waiting here would
+            # show nothing until the end; the dispatch step polls the queue
+            # instead and parses this line:
+            echo "SUBMITTED_JOBID=${JOBID:-unknown} JOBLOG=$ROOT/worker-run.log"
+            exit 0
+          fi
+          [ -n "$WNAME" ] || WNAME=worker-$(hostname -s)
+          if [ -z "$IS_LOCAL" ]; then
+            # remote sites must go through the tunnel; if the port answers
+            # with no tunnel present, another service owns it
+            TPAT="[-]L [^ ]*$PORT:localhost:$PORT"
+            if ! pgrep -f "$TPAT" >/dev/null; then
+              if health; then
+                echo "ERROR: 127.0.0.1:$PORT already answers on this site but no tunnel to $SRV_RES exists; another service owns the port"
+                exit 1
+              fi
+            elif ! ws_ok "http://127.0.0.1:$PORT"; then
+              echo "existing tunnel fails the websocket probe; recreating it"
+              pkill -f "$TPAT" || true
+              sleep 1
+            fi
+            if ! pgrep -f "$TPAT" >/dev/null; then
+              start_tunnel "$PORT:localhost:$PORT"
+            fi
+            ok=""
+            for i in $(seq 1 20); do health && ws_ok "http://127.0.0.1:$PORT" && ok=1 && break; sleep 1; done
+            [ -n "$ok" ] || { echo "ERROR: server unreachable through tunnel; tunnel.log:"; tail -20 "$ROOT/tunnel.log"; exit 1; }
+          elif ! health; then
+            echo "ERROR: this is the server host but the server is not answering on :$PORT"
+            exit 1
+          fi
+          if pgrep -f "worker.py 127.0.0.1 $PORT $WNAME" >/dev/null; then
+            echo "worker already running (pid $(pgrep -f "worker.py 127.0.0.1 $PORT $WNAME" | head -1))"
+            exit 0
+          fi
+          # restart until the Connected line appears; a transient tunnel
+          # blip would otherwise strand the first attempt
+          rm -f "$ROOT/worker.log"
+          for ATT in 1 2 3; do
+            setsid -f python3 "$ROOT/worker.py" 127.0.0.1 "$PORT" "$WNAME" > "$ROOT/worker.log" 2>&1 < /dev/null
+            ok=""
+            for i in $(seq 1 15); do
+              grep -aq "WebSocket Connected" "$ROOT/worker.log" 2>/dev/null && ok=1 && break
+              sleep 2
+            done
+            [ -n "$ok" ] && break
+            echo "attempt $ATT: worker did not connect; retrying"
+            pkill -f "worker.py 127.0.0.1 $PORT $WNAME" || true
+            sleep 2
+          done
+          grep -aq "WebSocket Connected" "$ROOT/worker.log" 2>/dev/null || {
+            echo "ERROR: worker did not connect; log:"; tail -20 "$ROOT/worker.log"; exit 1; }
+          echo "worker '$WNAME' running on $(hostname) (log: $ROOT/worker.log)"
+          WBOOTEOF
+          )
+          TSV=$WORKDIR/.workers.tsv
+          printf '%s' "$WORKERS_JSON" | python3 -c '
+          import base64, json, sys
+          try:
+              items = json.load(sys.stdin) or []
+          except Exception:
+              items = []
+          for w in items:
+              r = w.get("resource") or {}
+              if isinstance(r, str):
+                  r = {"name": r}
+              name = (r.get("uri")
+                      or ("pw://%s/%s" % (r["namespace"], r["name"]) if r.get("namespace") and r.get("name") else "")
+                      or r.get("name") or r.get("ip") or "")
+              sched = "none"
+              if str(w.get("scheduler")).lower() == "true":
+                  st = (r.get("schedulerType") or "").lower()
+                  if st in ("slurm", "pbs"):
+                      sched = st
+                  else:
+                      print("WARNING: %s: scheduler requested but schedulerType is %r; running unscheduled" % (name, st), file=sys.stderr)
+              sl = w.get("slurm") or {}
+              pb = w.get("pbs") or {}
+              pq = acct = wt = extra = pbsd = ""
+              if sched == "slurm":
+                  pq, acct, wt, extra = sl.get("partition") or "", sl.get("account") or "", sl.get("time") or "", sl.get("extra") or ""
+              elif sched == "pbs":
+                  acct = pb.get("account") or ""
+                  pbsd = base64.b64encode((pb.get("scheduler_directives") or "").encode()).decode()
+              print(chr(31).join([name, w.get("worker_name") or "", w.get("workdir") or "~/app-testbed-worker", sched, pq, acct, wt, extra, pbsd]))
+          ' > "$TSV"
+          if [ ! -s "$TSV" ]; then
+            echo "no worker sites configured; nothing to do"
+            rm -f "$TSV"
+            exit 0
+          fi
+          # per-poll status probe run on the worker site:
+          # prints STATE=<queue state>|LOG=<yes/no>|CONN=<connect count>
+          PROBE_B64=$(base64 -w0 <<'PROBEEOF'
+          JOBID=$1; JOBLOG=$2; SCHED=$3
+          if [ "$SCHED" = "slurm" ]; then
+            ST=$(squeue -h -j "$JOBID" -o "%T %r" 2>/dev/null | head -1)
+          else
+            ST=$(qstat "$JOBID" 2>/dev/null | tail -1 | awk '{print $5}')
+          fi
+          CONN=0; LOGE=no
+          if [ -f "$JOBLOG" ]; then
+            LOGE=yes
+            CONN=$(grep -ac "WebSocket Connected" "$JOBLOG" 2>/dev/null)
+            CONN=${CONN:-0}
+          fi
+          echo "STATE=${ST:-gone}|LOG=$LOGE|CONN=$CONN"
+          PROBEEOF
+          )
+          FAILED=""
+          # unit-separator delimiter: tab is IFS whitespace and collapses
+          # empty fields, which would drop a blank worker_name
+          while IFS="$(printf '\037')" read -r NAME WNAME WD SCHED PQ ACCT WT EXTRA PBSD; do
+            [ -n "$NAME" ] || continue
+            echo ""
+            echo "=== dispatching worker to $NAME (scheduler=$SCHED) ==="
+            # forward the platform-injected auth env; plain pw ssh shells
+            # have no pw context of their own. bash -ls gives a login-shell
+            # PATH on the remote side.
+            LOCAL=""
+            [ "$NAME" = "$SRV_RES" ] && LOCAL=1
+            if OUT=$(pw ssh "$NAME" "export PW_API_KEY='$PW_API_KEY' PW_PLATFORM_HOST='$PW_PLATFORM_HOST'; echo $BOOT_B64 | base64 -d | bash -ls -- '$PORT' '$SRV_RES' '$WNAME' '$WD' '$SCHED' '$PQ' '$ACCT' '$WT' '$EXTRA' '$TMETHOD' '$LOCAL' '$SRV_USER' '$PBSD'" 2>&1); then
+              echo "$OUT"
+              JOBID=$(echo "$OUT" | grep -a 'SUBMITTED_JOBID=' | grep -oE 'SUBMITTED_JOBID=[0-9]+' | head -1 | cut -d= -f2)
+              JOBLOG=$(echo "$OUT" | grep -a 'JOBLOG=' | grep -oE 'JOBLOG=[^ ]+' | head -1 | cut -d= -f2)
+              if [ -z "$JOBID" ]; then
+                echo "=== $NAME: OK ==="
+              elif [ "$WAIT_WORKERS" != "true" ]; then
+                echo "job $JOBID submitted; not waiting for connect. Progress log: $JOBLOG on $NAME"
+                echo "=== $NAME: OK (submitted) ==="
+              else
+                # watch from this step so queue states stream into the run
+                # log in real time
+                echo "watching job $JOBID on $NAME (polling every ~15s, up to ~35 min)"
+                LAST=""; CONN=0; LOGE=no; ST=""; SCONW=0
+                for i in $(seq 1 120); do
+                  P=$(pw ssh "$NAME" "echo $PROBE_B64 | base64 -d | bash -s -- '$JOBID' '$JOBLOG' '$SCHED'" 2>/dev/null | grep -a '^STATE=' | head -1)
+                  if [ -z "$P" ]; then echo "  (probe failed; retrying)"; sleep 15; continue; fi
+                  ST=$(echo "$P" | sed -n 's/^STATE=\([^|]*\).*/\1/p')
+                  LOGE=$(echo "$P" | sed -n 's/.*|LOG=\([^|]*\).*/\1/p')
+                  CONN=$(echo "$P" | sed -n 's/.*|CONN=\([0-9]*\)$/\1/p'); CONN=${CONN:-0}
+                  [ "$ST" != "$LAST" ] && echo "  queue: $ST"
+                  LAST=$ST
+                  [ "$CONN" -ge 1 ] && break
+                  if [ "$LOGE" = "yes" ]; then
+                    SCONW=$((SCONW+1))
+                    [ "$SCONW" = "1" ] && echo "  job is running; waiting for worker websocket connect..."
+                    [ "$SCONW" -ge 24 ] && break
+                  fi
+                  [ "$ST" = "gone" ] && break
+                  sleep 15
+                done
+                if [ "$CONN" -ge 1 ]; then
+                  echo "--- worker connected; job log highlights ---"
+                  pw ssh "$NAME" "grep -a 'registered\|Connected' '$JOBLOG' 2>/dev/null | head -3; true" 2>/dev/null
+                  echo "=== $NAME: OK (job $JOBID, worker connected) ==="
+                elif [ "$LOGE" = "yes" ] || [ "$ST" = "gone" ]; then
+                  echo "ERROR: worker on $NAME did not connect (job $JOBID, state ${ST:-?}); job log tail:"
+                  pw ssh "$NAME" "tail -20 '$JOBLOG' 2>/dev/null; true" 2>/dev/null
+                  echo "=== $NAME: FAILED ==="
+                  FAILED="$FAILED $NAME"
+                else
+                  echo "NOTE: job $JOBID still queued (state $ST) after the watch window; the worker registers when it starts"
+                  echo "=== $NAME: OK (submitted; still queued) ==="
+                fi
+              fi
+            else
+              echo "$OUT"
+              echo "=== $NAME: FAILED ==="
+              FAILED="$FAILED $NAME"
+            fi
+          done < "$TSV"
+          rm -f "$TSV"
+          [ -z "$FAILED" ] || { echo "ERROR: worker dispatch failed on:$FAILED"; exit 1; }
+          echo "all worker sites dispatched"
