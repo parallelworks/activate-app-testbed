@@ -3,7 +3,7 @@
 # follow it to completion, and print the dispatch log. Set PW_CONTEXT to
 # override the pw context.
 #
-# Usage: scripts/manual/run-worker.sh [inputs.json] [workflow-name]
+# Usage: ./run-worker.sh [inputs.json] [workflow-name]
 set -e
 INPUTS=${1:-$(dirname "$0")/worker-inputs.json}
 WORKFLOW=${2:-app-testbed}
