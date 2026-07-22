@@ -2,8 +2,9 @@
 """Launch testbed workers through the generic workflow using the pw CLI.
 
 Submits a run (server deployed if not already running; --no-deploy-server
-for workers-only) and follows it until it finishes. Targets the published
-app-testbed workflow; pass --workflow ./workflow.yaml for the local file.
+for workers-only) and follows it until it finishes. Targets the
+marketplace workflow (add it with `pw marketplace add-to-account
+app-testbed`); pass --workflow ./workflow.yaml for the local file.
 
 Examples:
   ./launch-worker.py --server-host clusterA --site clusterB
@@ -193,7 +194,8 @@ def main():
     arg("--port", type=int, default=8090)
     arg("--tunnel-method", choices=["auto", "ssh", "pw-forward"], default="auto",
         help="pw-forward verifies whether a pw CLI release passes websocket upgrades")
-    arg("--workflow", default="app-testbed", help="published workflow name or local yaml path")
+    arg("--workflow", default="marketplace.app-testbed.v1.0",
+        help="workflow name or local yaml path")
     arg("--context", default=os.environ.get("PW_CONTEXT", ""), help="pw CLI context")
     arg("--no-watch", dest="watch", action="store_false", default=True)
     arg("--poll", type=int, default=15)

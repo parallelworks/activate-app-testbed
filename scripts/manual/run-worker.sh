@@ -6,7 +6,7 @@
 # Usage: ./run-worker.sh [inputs.json] [workflow-name]
 set -e
 INPUTS=${1:-$(dirname "$0")/worker-inputs.json}
-WORKFLOW=${2:-app-testbed}
+WORKFLOW=${2:-marketplace.app-testbed.v1.0}
 PW="pw${PW_CONTEXT:+ --context $PW_CONTEXT}"
 
 [ -f "$INPUTS" ] || { echo "ERROR: inputs file not found: $INPUTS"; exit 1; }

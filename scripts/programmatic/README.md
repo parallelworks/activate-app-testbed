@@ -1,8 +1,10 @@
 # Programmatic launch
 
 `launch-worker.py` resolves cluster names or `pw://owner/name` URIs to
-full resource objects, builds the workflow inputs, submits the published
-`app-testbed` workflow, and follows the run until the workers connect:
+full resource objects, builds the workflow inputs, submits the
+marketplace workflow (`marketplace.app-testbed.v1.0` — add it to your
+account once with `pw marketplace add-to-account app-testbed`), and
+follows the run until the workers connect:
 
 ```bash
 # server plus one worker on another cluster

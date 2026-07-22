@@ -1,9 +1,10 @@
 # Manual launch
 
-Launch a testbed run with the pw CLI alone:
+Launch a testbed run with the pw CLI alone (add the workflow to your
+account once with `pw marketplace add-to-account app-testbed`):
 
 ```bash
-pw workflows run app-testbed -i worker-inputs.json
+pw workflows run marketplace.app-testbed.v1.0 -i worker-inputs.json
 ```
 
 Fill in the `resource` blocks in `worker-inputs.json` for your clusters

@@ -24,15 +24,21 @@ no staged files.
 
 ## Publishing
 
-The workflow is published on the platform as `app-testbed`:
+The workflow is published as the marketplace item `app-testbed`, managed
+from this repository:
 
 ```bash
-pw workflows create --yaml workflow.yaml app-testbed   # first time
-pw workflows update --yaml workflow.yaml app-testbed   # after edits
+pw marketplace publish --name "Multi-site App Testbed" --slug app-testbed \
+    --repo <this repo URL> --branch main \
+    --workflow-yaml workflow.yaml --thumbnail thumbnail.png --readme README.md
 ```
 
-`scripts/programmatic/launch-worker.py` targets the published `app-testbed` by default; pass
-`--workflow ./workflow.yaml` to run the local file without publishing.
+Users add it to their account with `pw marketplace add-to-account
+app-testbed`, which creates a workflow reference named after the added
+version (e.g. `marketplace.app-testbed.v1.0`).
+`scripts/programmatic/launch-worker.py` targets that reference by
+default; pass `--workflow ./workflow.yaml` to run the local file
+without publishing.
 
 ## Manual launch from a static inputs file
 
