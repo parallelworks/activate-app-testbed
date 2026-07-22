@@ -389,7 +389,7 @@ jobs:
             fi
             echo "starting $USE tunnel to $SRV_RES"
             if [ "$USE" = "ssh" ]; then
-              setsid -f ssh -i "$HOME/.ssh/pwcli" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o "ProxyCommand=pw ssh --proxy-command %h" -N -L "$1" "${SRV_USER:-$USER}@$SRV_RES" > "$ROOT/tunnel.log" 2>&1 < /dev/null
+              setsid -f ssh -i "$HOME/.ssh/pwcli" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o "ProxyCommand=pw ssh --proxy-command %h" -N -L "$1" "${PW_USER:-${SRV_USER:-$USER}}@$SRV_RES" > "$ROOT/tunnel.log" 2>&1 < /dev/null
             else
               setsid -f pw forward -L "$1" "$SRV_RES" > "$ROOT/tunnel.log" 2>&1 < /dev/null
             fi
